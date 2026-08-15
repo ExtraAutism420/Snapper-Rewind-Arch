@@ -1,0 +1,152 @@
+#!/bin/bash
+# snapper-uki - Generate bootable UKIs for all snapshots that lack one
+
+set -e
+
+# Configuration
+ESP="/boot"
+UKI_DIR="$ESP/EFI/Linux"
+SNAPSHOT_ROOT="/.snapshots"
+KERNEL_IMAGE="/boot/vmlinuz-linux-zen"
+if [ ! -f "$KERNEL_IMAGE" ]; then
+    echo "Kernel image not found."
+    exit 1
+fi
+
+KERNEL_VERSION=$(ls -1t /lib/modules/ 2>/dev/null | head -1)
+if [ -z "$KERNEL_VERSION" ]; then
+    echo "No modules directory found."
+    exit 1
+fi
+MAX_UKIS=3
+SNAPPER_CONFIG="root"
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit 1
+fi
+
+# Get all snapshot IDs (numeric) from snapper list, sorted numerically
+SNAPSHOT_IDS=($(snapper -c "$SNAPPER_CONFIG" list | awk '/^[0-9]+/ && $1 != 0 {print $1}' | sort -n))
+
+if [ ${#SNAPSHOT_IDS[@]} -eq 0 ]; then
+    echo "No snapshots found."
+    exit 0
+fi
+
+# Function to build a UKI for a given snapshot ID
+build_uki() {
+    local SNAPSHOT_ID="$1"
+    SNAPSHOT_PATH="$SNAPSHOT_ROOT/$SNAPSHOT_ID/snapshot"
+    if [ ! -d "$SNAPSHOT_PATH" ]; then
+        echo "Snapshot path $SNAPSHOT_PATH does not exist, skipping."
+        return 1
+    fi
+
+    # Check if UKI already exists (with any suffix)
+    if ls "$UKI_DIR"/snapshot-"$SNAPSHOT_ID"*.efi 1> /dev/null 2>&1; then
+        echo "UKI for snapshot $SNAPSHOT_ID already exists, skipping."
+        return 0
+    fi
+
+    # Get subvolume ID
+    SUBVOLID=$(btrfs subvolume show "$SNAPSHOT_PATH" | grep "Subvolume ID" | awk '{print $3}')
+    if [ -z "$SUBVOLID" ]; then
+        echo "Failed to get subvolume ID for snapshot $SNAPSHOT_ID, skipping."
+        return 1
+    fi
+
+    # Create kernel command line
+    if [ -f /etc/kernel/cmdline ]; then
+        BASE_CMDLINE=$(cat /etc/kernel/cmdline | tr '\n' ' ' | sed -E 's/rootflags=[^ ]* //g')
+    else
+        echo "ERROR: /etc/kernel/cmdline not found."
+        return 1
+    fi
+    CMD_LINE="${BASE_CMDLINE} rootflags=subvolid=${SUBVOLID} snapshot=${SNAPSHOT_ID} systemd.mask=systemd-bless-boot.service systemd.mask=sign-renamed-uki.service"
+
+    # Build initramfs
+    INITRD="/tmp/initramfs-$$.img"
+    mkinitcpio -k "$KERNEL_VERSION" -g "$INITRD"
+
+    # Build UKI with boot counters if enabled
+    if [ -f /etc/kernel/tries ]; then
+        TRIES=$(cat /etc/kernel/tries)
+        UKI_NAME="snapshot-$SNAPSHOT_ID+$TRIES-$((TRIES - 1)).efi"
+    else
+        UKI_NAME="snapshot-$SNAPSHOT_ID.efi"
+    fi
+
+    UKI_PATH="$UKI_DIR/$UKI_NAME"
+    ukify build \
+        --linux="$KERNEL_IMAGE" \
+        --initrd="$INITRD" \
+        --cmdline="$CMD_LINE" \
+        --output="$UKI_PATH"
+
+    rm -f "$INITRD"
+
+    # Sign with sbctl
+    if command -v sbctl &> /dev/null; then
+        echo "Signing UKI: $UKI_NAME"
+        sbctl sign -s "$UKI_PATH"
+    fi
+
+    # Make the snapshot writable so it can boot
+    if [ -d "$SNAPSHOT_PATH" ]; then
+        echo "Making snapshot $SNAPSHOT_ID writable..."
+        btrfs property set "$SNAPSHOT_PATH" ro false
+    fi
+    
+    echo "UKI created for snapshot $SNAPSHOT_ID: $UKI_NAME"
+}
+
+# Build for each snapshot
+for ID in "${SNAPSHOT_IDS[@]}"; do
+    build_uki "$ID"
+done
+
+# --- Clean up old snapshots first ---
+echo "Cleaning up old snapshots..."
+if [ ${#SNAPSHOT_IDS[@]} -gt 3 ]; then
+    TO_DELETE=(${SNAPSHOT_IDS[@]:0:${#SNAPSHOT_IDS[@]}-3})
+    for ID in "${TO_DELETE[@]}"; do
+        echo "Deleting old snapshot: $ID"
+        snapper -c "$SNAPPER_CONFIG" delete "$ID"
+    done
+    # Re-read snapshot list after deletion
+    SNAPSHOT_IDS=($(snapper -c "$SNAPPER_CONFIG" list | awk '/^[0-9]+/ && $1 != 0 {print $1}' | sort -n))
+    LATEST_ID="${SNAPSHOT_IDS[-1]}"
+fi
+
+# --- Update fallback (copy latest snapshot to fixed name) ---
+LATEST_UKI=$(ls -1 "$UKI_DIR"/snapshot-"$LATEST_ID"*.efi 2>/dev/null | head -1)
+if [ -n "$LATEST_UKI" ]; then
+    cp "$LATEST_UKI" "$UKI_DIR/latest-snapshot.efi"
+    echo "Updated latest-snapshot.efi from snapshot $LATEST_ID."
+fi
+
+# --- Clean up old UKIs (keep latest $MAX_UKIS, only for existing snapshots) ---
+cd "$UKI_DIR" || exit
+echo "Cleaning up old UKIs..."
+ls -1t snapshot-*.efi 2>/dev/null | tail -n +$((MAX_UKIS + 1)) | while read OLD_UKI; do
+    OLD_ID=$(echo "$OLD_UKI" | sed -E 's/snapshot-([0-9]+).*/\1/')
+    # Only remove if snapshot no longer exists (shouldn't happen, but safeguard)
+    if ! echo "${SNAPSHOT_IDS[@]}" | grep -qw "$OLD_ID"; then
+        echo "Removing old UKI: $OLD_UKI (snapshot $OLD_ID does not exist)"
+        rm -f "$OLD_UKI"
+        rm -f "$ESP/loader/entries/snapshot-$OLD_ID.conf"
+    else
+        echo "Keeping UKI for snapshot $OLD_ID (snapshot exists)"
+    fi
+done
+
+# Clean up stale sbctl entries for missing EFI files
+if command -v sbctl &> /dev/null; then
+    echo "Cleaning stale sbctl entries..."
+    while sbctl verify --quiet 2>&1 | grep -q "does not exist"; do
+        sbctl verify --quiet 2>&1 | awk '{print $2}' | xargs -r sbctl remove-file
+    done
+fi
+
+echo "All done."

@@ -1,0 +1,10 @@
+[Unit]
+Description=Rollback to snapshot if booted from snapshot
+
+[Timer]
+OnBootSec=15s
+Unit=rollback-on-snapshot.service
+
+[Install]
+WantedBy=timers.target
+

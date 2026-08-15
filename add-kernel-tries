@@ -1,0 +1,14 @@
+#!/bin/bash
+KERNEL="/boot/EFI/Linux/arch-linux-zen.efi"
+if [ -f "$KERNEL" ]; then
+    if [[ ! "$KERNEL" =~ \+[0-9]+- ]]; then
+        if command -v sbctl &> /dev/null; then
+            sbctl remove-file "$KERNEL" 2>/dev/null || true
+        fi
+        mv "$KERNEL" "/boot/EFI/Linux/arch-linux-zen+3-2.efi"
+        echo "Renamed kernel to include boot counter."
+        if command -v sbctl &> /dev/null; then
+            sbctl sign -s "/boot/EFI/Linux/arch-linux-zen+3-2.efi"
+        fi
+    fi
+fi

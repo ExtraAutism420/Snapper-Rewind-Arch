@@ -1,0 +1,10 @@
+[Unit]
+Description=Restore kernel counter after boot
+Requires=restore-kernel-counter.service
+
+[Timer]
+OnBootSec=20s
+Unit=restore-kernel-counter.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh pacman and flatpak databases for status display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pacman -Syy --noconfirm
+ExecStart=/bin/sh -c "/usr/bin/flatpak update --no-pull 2>/dev/null || true"
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

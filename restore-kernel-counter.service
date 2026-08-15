@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore boot counter to default kernel after bless-boot clears it
+After=systemd-bless-boot.service
+Requires=systemd-bless-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/add-kernel-tries
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Rollback to snapshot if booted from snapshot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/auto-rollback-on-snapshot-boot
+RemainAfterExit=yes
+#StandardOutput=journal+console
+#StandardError=journal+console

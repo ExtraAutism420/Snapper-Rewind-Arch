@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Generating UKI for latest Snapper snapshot...
+When = PostTransaction
+Exec = /usr/local/bin/snapper-uki
+Depends = snapper

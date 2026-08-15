@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Package
+Target = linux-zen
+
+[Action]
+Description = Adding boot counter to default kernel...
+When = PostTransaction
+Exec = /usr/local/bin/add-kernel-tries
+Depends = coreutils

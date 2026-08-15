@@ -1,0 +1,602 @@
+#!/bin/bash
+# build.sh - Build Snapper-Rewind package dynamically from templates
+# Usage: 
+#   ./build.sh          # builds the package in ./Snapper-Rewind
+#   ./build.sh --deploy # builds and deploys immediately
+#   ./build.sh --help   # shows help
+
+set -e
+
+echo "Snapper-Rewind – Copyright (C) 2026 Sabastian Harbaugh – GPLv3"
+
+# === Colors ===
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+error() { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+info() { echo -e "${GREEN}>>>${NC} $*"; }
+warn() { echo -e "${YELLOW}WARNING:${NC} $*"; }
+section() { echo -e "${BLUE}=== $* ===${NC}"; }
+
+# === Help ===
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --deploy       Build and deploy immediately (requires root)
+  --no-deploy    Build only, don't deploy (default)
+  --kernel NAME  Override kernel name (e.g., linux, linux-lts)
+  --timer SECS   Override timer delay in seconds (e.g., 30s)
+  --tries NUM    Override number of boot attempts (default: 3)
+  --keep NUM     Override number of UKIs/snapshots to keep (default: 3)
+  --help         Show this help
+
+This script builds a self-contained rollback system package in ./Snapper-Rewind
+by detecting your system's kernel, boot time, and using templates.
+EOF
+    exit 0
+fi
+
+# === Parse arguments ===
+DEPLOY=false
+KERNEL_NAME=""
+TIMER_DELAY=""
+TRIES="3"
+MAX_UKIS="3"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --deploy) DEPLOY=true; shift ;;
+        --no-deploy) DEPLOY=false; shift ;;
+        --kernel) KERNEL_NAME="$2"; shift 2 ;;
+        --timer) TIMER_DELAY="$2"; shift 2 ;;
+        --tries) TRIES="$2"; shift 2 ;;
+        --keep) MAX_UKIS="$2"; shift 2 ;;
+        *) error "Unknown option: $1" ;;
+    esac
+done
+
+# === Auto-detect kernel ===
+if [[ -z "$KERNEL_NAME" ]]; then
+    if [[ -f "/boot/vmlinuz-linux-zen" ]]; then
+        KERNEL_NAME="linux-zen"
+    elif [[ -f "/boot/vmlinuz-linux" ]]; then
+        KERNEL_NAME="linux"
+    elif [[ -f "/boot/vmlinuz-linux-lts" ]]; then
+        KERNEL_NAME="linux-lts"
+    else
+        KERNEL_NAME="linux"
+        warn "Could not detect kernel, using '$KERNEL_NAME'."
+    fi
+    info "Detected kernel: $KERNEL_NAME"
+fi
+
+# === Auto-detect boot time for timer delay ===
+if [[ -z "$TIMER_DELAY" ]]; then
+    if command -v systemd-analyze &>/dev/null; then
+        # Extract the userspace time from systemd-analyze output
+        BOOT_TIME=$(systemd-analyze 2>/dev/null | grep -o '[0-9.]\+s (userspace)' | head -1 | sed 's/[^0-9.]//g')
+        if [[ -z "$BOOT_TIME" ]]; then
+            BOOT_TIME=$(systemd-analyze 2>/dev/null | grep -o '[0-9.]\+s (userspace)' | head -1 | sed 's/[^0-9.]//g')
+        fi
+        if [[ -n "$BOOT_TIME" ]]; then
+            BOOT_SEC=$(printf "%.0f" "$BOOT_TIME")
+            DELAY_SEC=$((BOOT_SEC + 5))
+            TIMER_DELAY="${DELAY_SEC}s"
+            info "Boot time: ${BOOT_TIME}s → timer delay: $TIMER_DELAY"
+        else
+            TIMER_DELAY="30s"
+            warn "Could not parse boot time, using default 30s."
+        fi
+    else
+        TIMER_DELAY="30s"
+        warn "systemd-analyze not found, using default 30s."
+    fi
+fi
+
+# === Validate ===
+[[ -n "$KERNEL_NAME" ]] || error "Kernel name not set."
+[[ -n "$TIMER_DELAY" ]] || error "Timer delay not set."
+[[ "$TRIES" =~ ^[0-9]+$ ]] || error "Tries must be a number."
+[[ "$MAX_UKIS" =~ ^[0-9]+$ ]] || error "MAX_UKIS must be a number."
+
+# === Package name and build directory ===
+PKG_NAME=$(basename "$PWD")
+BUILD_DIR="./$PKG_NAME"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+section "Building $PKG_NAME"
+info "Kernel: $KERNEL_NAME"
+info "Timer delay: $TIMER_DELAY"
+info "Boot attempts: $TRIES"
+info "UKIs to keep: $MAX_UKIS"
+
+# === Generate files from templates ===
+
+# 1. tries
+echo "$TRIES" > "$BUILD_DIR/tries"
+
+# 2. root.template
+cat > "$BUILD_DIR/root.template" <<'EOF'
+SUBVOLUME="/"
+FSTYPE="btrfs"
+ALLOW_USERS=""
+ALLOW_GROUPS=""
+TIMELINE_CREATE="no"
+TIMELINE_CLEANUP="no"
+TIMELINE_LIMIT_HOURLY="10"
+TIMELINE_LIMIT_DAILY="10"
+TIMELINE_LIMIT_WEEKLY="10"
+TIMELINE_LIMIT_MONTHLY="10"
+TIMELINE_LIMIT_QUARTERLY="10"
+TIMELINE_LIMIT_YEARLY="10"
+NUMBER_CLEANUP="yes"
+NUMBER_LIMIT="3"
+NUMBER_LIMIT_IMPORTANT="3"
+SNAPSHOT_DIR="/.snapshots"
+EXCLUDE="/.snapshots"
+EOF
+
+# 3. rollback-on-snapshot.timer
+cat > "$BUILD_DIR/rollback-on-snapshot.timer" <<EOF
+[Unit]
+Description=Rollback to snapshot if booted from snapshot
+
+[Timer]
+OnBootSec=$TIMER_DELAY
+Unit=rollback-on-snapshot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# 4. restore-kernel-counter.timer
+cat > "$BUILD_DIR/restore-kernel-counter.timer" <<EOF
+[Unit]
+Description=Restore kernel counter after boot
+
+[Timer]
+OnBootSec=10s
+Unit=restore-kernel-counter.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# 5. snapper-uki
+cat > "$BUILD_DIR/snapper-uki" <<EOF
+#!/bin/bash
+# snapper-uki - Generated by build.sh
+# Kernel: $KERNEL_NAME
+
+set -e
+
+ESP="/boot"
+UKI_DIR="\$ESP/EFI/Linux"
+SNAPSHOT_ROOT="/.snapshots"
+KERNEL_IMAGE="/boot/vmlinuz-$KERNEL_NAME"
+if [ ! -f "\$KERNEL_IMAGE" ]; then
+    echo "Kernel image not found."
+    exit 1
+fi
+
+KERNEL_VERSION=\$(ls -1t /lib/modules/ 2>/dev/null | head -1)
+if [ -z "\$KERNEL_VERSION" ]; then
+    echo "No modules directory found."
+    exit 1
+fi
+MAX_UKIS=$MAX_UKIS
+SNAPPER_CONFIG="root"
+
+if [ "\$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit 1
+fi
+
+SNAPSHOT_IDS=(\$(snapper -c "\$SNAPPER_CONFIG" list | awk '/^[0-9]+/ && \$1 != 0 {print \$1}' | sort -n))
+
+if [ \${#SNAPSHOT_IDS[@]} -eq 0 ]; then
+    echo "No snapshots found."
+    exit 0
+fi
+
+build_uki() {
+    local SNAPSHOT_ID="\$1"
+    SNAPSHOT_PATH="\$SNAPSHOT_ROOT/\$SNAPSHOT_ID/snapshot"
+    if [ ! -d "\$SNAPSHOT_PATH" ]; then
+        echo "Snapshot path \$SNAPSHOT_PATH does not exist, skipping."
+        return 1
+    fi
+
+    if ls "\$UKI_DIR"/snapshot-"\$SNAPSHOT_ID"*.efi 1>/dev/null 2>&1; then
+        echo "UKI for snapshot \$SNAPSHOT_ID already exists, skipping."
+        return 0
+    fi
+
+    SUBVOLID=\$(btrfs subvolume show "\$SNAPSHOT_PATH" | grep "Subvolume ID" | awk '{print \$3}')
+    if [ -z "\$SUBVOLID" ]; then
+        echo "Failed to get subvolume ID for snapshot \$SNAPSHOT_ID, skipping."
+        return 1
+    fi
+
+    if [ -f /etc/kernel/cmdline ]; then
+        BASE_CMDLINE=\$(cat /etc/kernel/cmdline | tr '\n' ' ' | sed -E 's/rootflags=[^ ]* //g')
+    else
+        echo "ERROR: /etc/kernel/cmdline not found."
+        return 1
+    fi
+    CMD_LINE="\${BASE_CMDLINE} rootflags=subvolid=\${SUBVOLID} snapshot=\${SNAPSHOT_ID} systemd.mask=systemd-bless-boot.service systemd.mask=sign-renamed-uki.service"
+
+    INITRD="/tmp/initramfs-\$\$.img"
+    mkinitcpio -k "\$KERNEL_VERSION" -g "\$INITRD"
+
+    if [ -f /etc/kernel/tries ]; then
+        TRIES=\$(cat /etc/kernel/tries)
+        UKI_NAME="snapshot-\$SNAPSHOT_ID+\$TRIES-\$((TRIES - 1)).efi"
+    else
+        UKI_NAME="snapshot-\$SNAPSHOT_ID.efi"
+    fi
+
+    UKI_PATH="\$UKI_DIR/\$UKI_NAME"
+    ukify build \\
+        --linux="\$KERNEL_IMAGE" \\
+        --initrd="\$INITRD" \\
+        --cmdline="\$CMD_LINE" \\
+        --output="\$UKI_PATH"
+
+    rm -f "\$INITRD"
+
+    if command -v sbctl &>/dev/null; then
+        echo "Signing UKI: \$UKI_NAME"
+        sbctl sign -s "\$UKI_PATH"
+    fi
+
+    if [ -d "\$SNAPSHOT_PATH" ]; then
+        echo "Making snapshot \$SNAPSHOT_ID writable..."
+        btrfs property set "\$SNAPSHOT_PATH" ro false
+    fi
+
+    echo "UKI created for snapshot \$SNAPSHOT_ID: \$UKI_NAME"
+}
+
+for ID in "\${SNAPSHOT_IDS[@]}"; do
+    build_uki "\$ID"
+done
+
+# --- Clean up old snapshots first ---
+echo "Cleaning up old snapshots..."
+if [ \${#SNAPSHOT_IDS[@]} -gt 3 ]; then
+    TO_DELETE=(\${SNAPSHOT_IDS[@]:0:\${#SNAPSHOT_IDS[@]}-3})
+    for ID in "\${TO_DELETE[@]}"; do
+        echo "Deleting old snapshot: \$ID"
+        snapper -c "\$SNAPPER_CONFIG" delete "\$ID"
+    done
+    # Re-read snapshot list after deletion
+    SNAPSHOT_IDS=(\$(snapper -c "\$SNAPPER_CONFIG" list | awk '/^[0-9]+/ && \$1 != 0 {print \$1}' | sort -n))
+    LATEST_ID="\${SNAPSHOT_IDS[-1]}"
+fi
+
+# --- Update fallback (copy latest snapshot to fixed name) ---
+LATEST_UKI=\$(ls -1 "\$UKI_DIR"/snapshot-"\$LATEST_ID"*.efi 2>/dev/null | head -1)
+if [ -n "\$LATEST_UKI" ]; then
+    cp "\$LATEST_UKI" "\$UKI_DIR/latest-snapshot.efi"
+    echo "Updated latest-snapshot.efi from snapshot \$LATEST_ID."
+fi
+
+# --- Clean up old UKIs (keep latest \$MAX_UKIS, only for existing snapshots) ---
+cd "\$UKI_DIR" || exit
+echo "Cleaning up old UKIs..."
+ls -1t snapshot-*.efi 2>/dev/null | tail -n +\$((MAX_UKIS + 1)) | while read OLD_UKI; do
+    OLD_ID=\$(echo "\$OLD_UKI" | sed -E 's/snapshot-([0-9]+).*/\\1/')
+    # Only remove if snapshot no longer exists (safeguard)
+    if ! echo "\${SNAPSHOT_IDS[@]}" | grep -qw "\$OLD_ID"; then
+        echo "Removing old UKI: \$OLD_UKI (snapshot \$OLD_ID does not exist)"
+        rm -f "\$OLD_UKI"
+        rm -f "\$ESP/loader/entries/snapshot-\$OLD_ID.conf"
+    else
+        echo "Keeping UKI for snapshot \$OLD_ID (snapshot exists)"
+    fi
+done
+
+# Clean stale sbctl entries
+if command -v sbctl &>/dev/null; then
+    echo "Cleaning stale sbctl entries..."
+    while sbctl verify --quiet 2>&1 | grep -q "does not exist"; do
+        sbctl verify --quiet 2>&1 | awk '{print \$2}' | xargs -r sbctl remove-file
+    done
+fi
+
+echo "All done."
+EOF
+
+# 6. auto-rollback-on-snapshot-boot
+echo "Generating auto-rollback-on-snapshot-boot..."
+cat > "$BUILD_DIR/auto-rollback-on-snapshot-boot" <<'EOF'
+#!/bin/bash
+# Auto-rollback when booting from a snapshot
+
+set -e
+set -x
+echo "Script started at $(date)"
+
+SNAPSHOT_ID=$(grep -oP 'snapshot=\K[0-9]+' /proc/cmdline || echo "")
+if [ -z "$SNAPSHOT_ID" ]; then
+    echo "No snapshot number found – not a snapshot boot."
+    exit 0
+fi
+
+CURRENT_ID=$(btrfs subvolume show / | grep -E '^[[:space:]]+Subvolume ID:' | awk '{print $3}')
+DEFAULT_ID=$(btrfs subvolume get-default / | awk '{print $2}')
+
+if [ "$CURRENT_ID" -eq "$DEFAULT_ID" ]; then
+    echo "Already on default subvolume – no rollback needed."
+    exit 0
+fi
+
+echo "Booting from snapshot $SNAPSHOT_ID (subvolid=$CURRENT_ID). Setting as default..."
+
+FLAG_FILE="/run/.rollback-done-$SNAPSHOT_ID"
+if [ -f "$FLAG_FILE" ]; then
+    echo "Rollback already performed for snapshot $SNAPSHOT_ID – skipping."
+    exit 0
+fi
+
+btrfs subvolume set-default "$CURRENT_ID" / || {
+    echo "Failed to set default subvolume. Manual intervention required."
+    exit 1
+}
+
+touch "$FLAG_FILE"
+echo "Default subvolume set to $CURRENT_ID (snapshot $SNAPSHOT_ID)."
+
+if command -v sbctl &>/dev/null; then
+    echo "Signing any renamed UKIs..."
+    [ -f /boot/EFI/Linux/arch-linux-zen.efi ] && sbctl sign -s /boot/EFI/Linux/arch-linux-zen.efi
+    for f in /boot/EFI/Linux/snapshot-*.efi; do
+        [ -f "$f" ] && sbctl sign -s "$f"
+    done
+fi
+
+echo "Rebooting in 5 seconds..."
+sleep 5
+systemctl reboot
+EOF
+
+# Check if the file was created
+if [ $? -ne 0 ]; then
+    echo "ERROR: Heredoc for auto-rollback-on-snapshot-boot failed."
+    exit 1
+fi
+if [ ! -f "$BUILD_DIR/auto-rollback-on-snapshot-boot" ]; then
+    echo "ERROR: auto-rollback-on-snapshot-boot was not created."
+    exit 1
+fi
+
+# 7. add-kernel-tries
+cat > "$BUILD_DIR/add-kernel-tries" <<EOF
+#!/bin/bash
+KERNEL="/boot/EFI/Linux/arch-linux-$KERNEL_NAME.efi"
+if [ -f "\$KERNEL" ]; then
+    if [[ ! "\$KERNEL" =~ \+[0-9]+- ]]; then
+        if command -v sbctl &>/dev/null; then
+            sbctl remove-file "\$KERNEL" 2>/dev/null || true
+        fi
+        mv "\$KERNEL" "/boot/EFI/Linux/arch-linux-$KERNEL_NAME+3-2.efi"
+        echo "Renamed kernel to include boot counter."
+        if command -v sbctl &>/dev/null; then
+            sbctl sign -s "/boot/EFI/Linux/arch-linux-$KERNEL_NAME+3-2.efi"
+        fi
+    fi
+fi
+EOF
+
+# 8. rollback-on-snapshot.service
+cat > "$BUILD_DIR/rollback-on-snapshot.service" <<'EOF'
+[Unit]
+Description=Rollback to snapshot if booted from snapshot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/auto-rollback-on-snapshot-boot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+EOF
+
+# 9. restore-kernel-counter.service
+cat > "$BUILD_DIR/restore-kernel-counter.service" <<'EOF'
+[Unit]
+Description=Restore kernel boot counter after systemd-bless-boot
+After=systemd-bless-boot.service
+Requires=systemd-bless-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/add-kernel-tries
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 10. rename-kernel.hook
+cat > "$BUILD_DIR/rename-kernel.hook" <<EOF
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Package
+Target = $KERNEL_NAME
+
+[Action]
+Description = Adding boot counter to default kernel...
+When = PostTransaction
+Exec = /usr/local/bin/add-kernel-tries
+Depends = coreutils
+EOF
+
+# 11. zzz-snapper-uki.hook
+cat > "$BUILD_DIR/zzz-snapper-uki.hook" <<'EOF'
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Generating UKI for latest Snapper snapshot...
+When = PostTransaction
+Exec = /usr/local/bin/snapper-uki
+Depends = snapper
+EOF
+
+# 12. systemd-bless-boot.service (mask)
+ln -sf /dev/null "$BUILD_DIR/systemd-bless-boot.service"
+
+# 13. systemd-bless-boot.service.d/override.conf
+mkdir -p "$BUILD_DIR/systemd-bless-boot.service.d"
+cat > "$BUILD_DIR/systemd-bless-boot.service.d/override.conf" <<'EOF'
+[Unit]
+ConditionPathIsReadWrite=/
+EOF
+
+# 14. README.md (if exists, copy; else generate)
+if [[ -f "README.md" ]]; then
+    cp README.md "$BUILD_DIR/"
+else
+    cat > "$BUILD_DIR/README.md" <<'EOF'
+# The Grove Haven Rewind
+
+A self‑healing Btrfs snapshot rollback system for Arch Linux.
+
+Generated dynamically by build.sh. See the script for configuration.
+EOF
+fi
+
+# 15. Copy this build script itself
+cp "$0" "$BUILD_DIR/build.sh" 2>/dev/null || true
+
+# Make scripts executable
+chmod +x "$BUILD_DIR"/{add-kernel-tries,auto-rollback-on-snapshot-boot,snapper-uki} 2>/dev/null || true
+
+# 16. loader.conf
+cat > "$BUILD_DIR/loader.conf" <<EOF
+timeout 0
+default arch-linux-$KERNEL_NAME*.efi
+editor no
+console-mode max
+EOF
+
+# === Summary ===
+section "Build complete"
+info "Package built in: $BUILD_DIR"
+info "Size: $(du -sh "$BUILD_DIR" | cut -f1)"
+ls -la "$BUILD_DIR"
+
+# === Deploy if requested ===
+if [[ "$DEPLOY" == "true" ]]; then
+    section "Deploying to target system"
+    if [[ $EUID -ne 0 ]]; then
+        error "Deployment requires root. Run with --deploy as root."
+    fi
+    cd "$BUILD_DIR"
+
+    # --- Create required directories ---
+    mkdir -p /etc/pacman.d/hooks /etc/kernel /etc/snapper/configs /usr/local/bin /etc/systemd/system
+
+    # --- Copy scripts (so snapper-uki is available) ---
+    info "Copying scripts..."
+    cp -v add-kernel-tries auto-rollback-on-snapshot-boot snapper-uki /usr/local/bin/
+    chmod +x /usr/local/bin/{add-kernel-tries,auto-rollback-on-snapshot-boot,snapper-uki}
+
+    # --- Setup Snapper and create initial snapshot ---
+    info "Setting up Snapper..."
+
+    # Install required packages (optional – comment out if you prefer to install manually)
+    pacman -S --needed --noconfirm snapper btrfs-progs sbctl snap-pac ukify
+
+    # Ensure .snapshots subvolume exists
+    if ! btrfs subvolume list / | grep -q ".snapshots"; then
+        btrfs subvolume create /.snapshots
+    fi
+
+    # If Snapper config is missing or not working, recreate it
+    if ! snapper -c root list &>/dev/null; then
+        # Remove any existing subvolume to avoid conflict
+        btrfs subvolume delete /.snapshots 2>/dev/null || true
+        snapper -c root create-config /
+        # Apply custom limits
+        sed -i 's/^NUMBER_LIMIT=.*/NUMBER_LIMIT="3"/' /etc/snapper/configs/root
+        sed -i 's/^NUMBER_LIMIT_IMPORTANT=.*/NUMBER_LIMIT_IMPORTANT="3"/' /etc/snapper/configs/root
+    fi
+
+    # Start snapperd (it's socket-activated, but ensure it's running)
+    systemctl restart snapperd
+
+    info "Creating initial snapshot..."
+    snapper -c root create --description "Initial"
+
+    info "Generating UKI for initial snapshot..."
+    /usr/local/bin/snapper-uki
+
+    # --- Copy systemd units ---
+    info "Copying systemd units..."
+    cp -v rollback-on-snapshot.{service,timer} /etc/systemd/system/
+    cp -v restore-kernel-counter.{service,timer} /etc/systemd/system/ 2>/dev/null || true
+
+    # --- Ensure systemd-bless-boot is unmasked and enabled ---
+    info "Ensuring systemd-bless-boot is enabled..."
+    systemctl unmask systemd-bless-boot.service 2>/dev/null || true
+    systemctl enable systemd-bless-boot.service 2>/dev/null || true
+
+    # (Optional) Copy the override file if it exists – it’s harmless
+    mkdir -p /etc/systemd/system/systemd-bless-boot.service.d
+    cp -v systemd-bless-boot.service.d/override.conf /etc/systemd/system/systemd-bless-boot.service.d/ 2>/dev/null || true
+
+    # --- Copy pacman hooks ---
+    info "Copying pacman hooks..."
+    cp -v rename-kernel.hook zzz-snapper-uki.hook /etc/pacman.d/hooks/
+
+    # --- Set boot tries ---
+    info "Setting boot tries..."
+    cp -v tries /etc/kernel/tries
+
+    # --- Copy snapper config template (if missing) ---
+    info "Copying snapper config template..."
+    if [[ ! -f /etc/snapper/configs/root ]]; then
+        cp -v root.template /etc/snapper/configs/root
+    else
+        echo "Snapper config already exists – please merge manually if needed."
+    fi
+
+    # --- Copy loader.conf ---
+    info "Copying loader.conf..."
+    mkdir -p /boot/loader
+    if [[ ! -f /boot/loader/loader.conf ]]; then
+        cp -v loader.conf /boot/loader/loader.conf
+    else
+        echo "loader.conf already exists – please merge manually if needed."
+    fi
+
+    # --- Reload and enable timers ---
+    systemctl daemon-reload
+    systemctl enable --now rollback-on-snapshot.timer
+    systemctl enable --now restore-kernel-counter.timer 2>/dev/null || true
+
+    # --- Rename default kernel to include boot counter ---
+    info "Renaming default kernel to include boot counter..."
+    /usr/local/bin/add-kernel-tries
+
+    info "Deployment complete."
+    echo ""
+    echo "Next steps:"
+    echo "  Reboot to test fallback."
+else
+    info "To deploy later, run: cd $BUILD_DIR && sudo ./build.sh --deploy"
+fi

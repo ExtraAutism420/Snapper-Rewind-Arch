@@ -1,0 +1,60 @@
+#!/bin/bash
+# Auto-rollback when booting from a snapshot (non-default subvolume)
+# Uses the kernel command line 'snapshot=' parameter.
+
+set -e
+set -x
+echo "Script started at $(date)"
+
+# Read snapshot number from kernel command line
+SNAPSHOT_ID=$(grep -oP 'snapshot=\K[0-9]+' /proc/cmdline || echo "")
+
+if [ -z "$SNAPSHOT_ID" ]; then
+    echo "No snapshot number found in kernel command line – not a snapshot boot."
+    exit 0
+fi
+
+# Get current subvolume ID
+CURRENT_ID=$(btrfs subvolume show / | grep -E '^[[:space:]]+Subvolume ID:' | awk '{print $3}')
+
+# Get default subvolume ID
+DEFAULT_ID=$(btrfs subvolume get-default / | awk '{print $2}')
+
+# If they are the same, we are already on the default – nothing to do.
+if [ "$CURRENT_ID" -eq "$DEFAULT_ID" ]; then
+    echo "Already on default subvolume – no rollback needed."
+    exit 0
+fi
+
+# We are on a snapshot – perform rollback
+echo "Booting from snapshot $SNAPSHOT_ID (subvolid=$CURRENT_ID). Setting as default..."
+
+# Prevent duplicate runs for this snapshot
+FLAG_FILE="/run/.rollback-done-$SNAPSHOT_ID"
+if [ -f "$FLAG_FILE" ]; then
+    echo "Rollback already performed for snapshot $SNAPSHOT_ID – skipping."
+    exit 0
+fi
+
+# Set the default subvolume to the current snapshot
+btrfs subvolume set-default "$CURRENT_ID" / || {
+    echo "Failed to set default subvolume. Manual intervention required."
+    exit 1
+}
+
+touch "$FLAG_FILE"
+echo "Default subvolume set to $CURRENT_ID (snapshot $SNAPSHOT_ID)."
+
+# Sign any renamed UKIs before reboot (optional)
+if command -v sbctl &> /dev/null; then
+    echo "Signing any renamed UKIs..."
+    [ -f /boot/EFI/Linux/arch-linux-zen.efi ] && sbctl sign -s /boot/EFI/Linux/arch-linux-zen.efi
+    for f in /boot/EFI/Linux/snapshot-*.efi; do
+        [ -f "$f" ] && sbctl sign -s "$f"
+    done
+fi
+
+# Reboot to apply the new default
+echo "Rebooting in 5 seconds..."
+sleep 5
+systemctl reboot
