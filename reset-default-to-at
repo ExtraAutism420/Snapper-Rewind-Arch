@@ -1,5 +1,7 @@
 #!/bin/bash
-# reset-default-to-at - Reset default Btrfs subvolume to ID 256 after kernel updates
+# reset-default-to-at - Sync new kernel modules to @ and reset default subvolume to ID 256
+
+set -e
 
 CURRENT_DEFAULT=$(btrfs subvolume get-default / | awk '{print $2}')
 
@@ -8,10 +10,42 @@ if [ "$CURRENT_DEFAULT" -eq 256 ]; then
     exit 0
 fi
 
-echo "⚠️  Default subvolume is $CURRENT_DEFAULT — resetting to 256"
+echo "⚠️  Default subvolume is $CURRENT_DEFAULT — syncing kernel modules and resetting to 256"
+
+# Find the newest kernel version (from modules directory)
+NEW_KERNEL_VERSION=$(ls -1t /usr/lib/modules/ | head -1)
+if [ -z "$NEW_KERNEL_VERSION" ]; then
+    echo "❌ ERROR: No kernel modules found in /usr/lib/modules/"
+    exit 1
+fi
+
+echo "📦 New kernel version detected: $NEW_KERNEL_VERSION"
+
+# Mount the root subvolume (@)
+MOUNT_POINT="/mnt/root_subvol"
+mkdir -p "$MOUNT_POINT"
+if ! mount -t btrfs -o subvolid=256 /dev/mapper/root "$MOUNT_POINT"; then
+    echo "❌ ERROR: Failed to mount root subvolume"
+    exit 1
+fi
+
+# Copy the new modules to @
+MODULES_SRC="/usr/lib/modules/$NEW_KERNEL_VERSION"
+MODULES_DEST="$MOUNT_POINT/usr/lib/modules/$NEW_KERNEL_VERSION"
+
+echo "📦 Copying kernel modules to @..."
+mkdir -p "$(dirname "$MODULES_DEST")"
+cp -r "$MODULES_SRC" "$MODULES_DEST"
+
+# Unmount
+umount "$MOUNT_POINT"
+rmdir "$MOUNT_POINT"
+
+echo "✅ Kernel modules synced to @ (ID 256)"
 
 # Reset the default subvolume
 btrfs subvolume set-default 256 /
+echo "✅ Default subvolume reset to @ (ID 256)"
 
 # Interactive reboot prompt (only if running in a terminal)
 if [ -t 0 ] && [ -t 1 ]; then
