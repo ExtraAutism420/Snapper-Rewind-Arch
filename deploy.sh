@@ -10,7 +10,7 @@ echo "=== Installing Snapper Rewind ==="
 
 # 1. Install required packages (optional – skip if already present)
 echo "Installing required packages..."
-pacman -S --needed --noconfirm snapper btrfs-progs sbctl snap-pac ukify
+pacman -S --needed --noconfirm snapper btrfs-progs sbctl snap-pac ukify rsync
 
 # 2. Copy scripts to /usr/local/bin/
 echo "Installing scripts..."

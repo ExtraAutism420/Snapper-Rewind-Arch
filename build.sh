@@ -496,7 +496,7 @@ EOF
 # 17. reset-default-to-at
 cat > "$BUILD_DIR/reset-default-to-at" <<'EOF'
 #!/bin/bash
-# reset-default-to-at - Sync new kernel modules to @ and reset default subvolume to ID 256
+# reset-default-to-at - Sync entire snapshot to @ and reset default subvolume to ID 256
 
 set -e
 
@@ -507,16 +507,7 @@ if [ "$CURRENT_DEFAULT" -eq 256 ]; then
     exit 0
 fi
 
-echo "⚠️  Default subvolume is $CURRENT_DEFAULT — syncing kernel modules and resetting to 256"
-
-# Find the newest kernel version (from modules directory)
-NEW_KERNEL_VERSION=$(ls -1t /usr/lib/modules/ | head -1)
-if [ -z "$NEW_KERNEL_VERSION" ]; then
-    echo "❌ ERROR: No kernel modules found in /usr/lib/modules/"
-    exit 1
-fi
-
-echo "📦 New kernel version detected: $NEW_KERNEL_VERSION"
+echo "⚠️  Default subvolume is $CURRENT_DEFAULT — syncing snapshot to @ and resetting to 256"
 
 # Mount the root subvolume (@)
 MOUNT_POINT="/mnt/root_subvol"
@@ -526,19 +517,17 @@ if ! mount -t btrfs -o subvolid=256 /dev/mapper/root "$MOUNT_POINT"; then
     exit 1
 fi
 
-# Copy the new modules to @
-MODULES_SRC="/usr/lib/modules/$NEW_KERNEL_VERSION"
-MODULES_DEST="$MOUNT_POINT/usr/lib/modules/$NEW_KERNEL_VERSION"
-
-echo "📦 Copying kernel modules to @..."
-mkdir -p "$(dirname "$MODULES_DEST")"
-cp -r "$MODULES_SRC" "$MODULES_DEST"
+# Sync the entire snapshot to @, excluding system and transient directories
+echo "📦 Syncing snapshot to @ (this may take a while)..."
+rsync -aAXv --delete \
+    --exclude={"/proc/*","/sys/*","/dev/*","/tmp/*","/run/*","/mnt/*","/media/*","/lost+found","/var/cache/pacman/pkg/*"} \
+    / "$MOUNT_POINT/"
 
 # Unmount
 umount "$MOUNT_POINT"
 rmdir "$MOUNT_POINT"
 
-echo "✅ Kernel modules synced to @ (ID 256)"
+echo "✅ Snapshot synced to @ (ID 256)"
 
 # Reset the default subvolume
 btrfs subvolume set-default 256 /
@@ -611,7 +600,7 @@ if [[ "$DEPLOY" == "true" ]]; then
     info "Setting up Snapper..."
 
     # Install required packages (optional – comment out if you prefer to install manually)
-    pacman -S --needed --noconfirm snapper btrfs-progs sbctl snap-pac ukify
+    pacman -S --needed --noconfirm snapper btrfs-progs sbctl snap-pac ukify rsync
 
     # Ensure .snapshots subvolume exists
     if ! btrfs subvolume list / | grep -q ".snapshots"; then
