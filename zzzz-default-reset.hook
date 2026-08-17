@@ -2,9 +2,9 @@
 Operation = Upgrade
 Operation = Install
 Type = Package
-#Target = linux
+Target = linux
 Target = linux-zen
-#Target = linux-lts
+Target = linux-lts
 
 [Action]
 Description = Resetting default subvolume to @ (ID 256) after kernel update...
