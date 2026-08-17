@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Package
+#Target = linux
+Target = linux-zen
+#Target = linux-lts
+
+[Action]
+Description = Resetting default subvolume to @ (ID 256) after kernel update...
+When = PostTransaction
+Exec = /usr/local/bin/reset-default-to-at
+Depends = btrfs-progs

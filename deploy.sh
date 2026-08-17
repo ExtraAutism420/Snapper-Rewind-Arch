@@ -48,7 +48,12 @@ else
     echo "loader.conf already exists – please merge manually if needed."
 fi
 
-# 8. Install snapper config (template – adjust on target)
+# 8. Reset default to @ hook
+cp -v reset-default-to-at /usr/local/bin/
+chmod +x /usr/local/bin/reset-default-to-at
+cp -v zzzz-default-reset.hook /etc/pacman.d/hooks/
+
+# 9. Install snapper config (template – adjust on target)
 echo "Copying snapper config template..."
 if [ ! -f /etc/snapper/configs/root ]; then
     mkdir -p /etc/snapper/configs
@@ -57,7 +62,7 @@ else
     echo "Snapper config already exists – please merge manually if needed."
 fi
 
-# 9. Validate and fix Snapper config if needed
+# 10. Validate and fix Snapper config if needed
 echo "Validating Snapper config..."
 if ! sudo snapper -c root list &>/dev/null; then
     echo "Snapper config 'root' is invalid. Recreating..."
@@ -68,12 +73,12 @@ if ! sudo snapper -c root list &>/dev/null; then
 fi
 sudo systemctl restart snapperd
 
-# 10. Enable timers
+# 11. Enable timers
 echo "Enabling timers..."
 systemctl enable --now rollback-on-snapshot.timer
 systemctl enable --now restore-kernel-counter.timer 2>/dev/null || true
 
-# 11. Optionally rename default kernel
+# 12. Optionally rename default kernel
 echo "Renaming default kernel to include boot counter..."
 /usr/local/bin/add-kernel-tries
 

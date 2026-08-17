@@ -1,0 +1,34 @@
+#!/bin/bash
+# reset-default-to-at - Reset default Btrfs subvolume to ID 256 after kernel updates
+
+CURRENT_DEFAULT=$(btrfs subvolume get-default / | awk '{print $2}')
+
+if [ "$CURRENT_DEFAULT" -eq 256 ]; then
+    echo "✅ Default already set to 256 — no action needed"
+    exit 0
+fi
+
+echo "⚠️  Default subvolume is $CURRENT_DEFAULT — resetting to 256"
+
+# Reset the default subvolume
+btrfs subvolume set-default 256 /
+
+# Interactive reboot prompt (only if running in a terminal)
+if [ -t 0 ] && [ -t 1 ]; then
+    echo "Do you want to reboot now to apply the change? (y/N): "
+    read -t 30 USER_INPUT
+
+    if [ -z "$USER_INPUT" ]; then
+        echo "⏳ No input received within 30 seconds — skipping reboot."
+        echo "The default subvolume has been reset. Reboot when ready."
+    elif [[ "$USER_INPUT" =~ ^[Yy]$ ]]; then
+        echo "🔄 Rebooting in 2 seconds..."
+        sleep 2
+        systemctl reboot
+    else
+        echo "❌ Skipping reboot. Default reset will apply on next reboot."
+    fi
+else
+    echo "⏳ Running in non‑interactive mode — resetting default without reboot."
+    echo "Default will be applied on next manual reboot."
+fi

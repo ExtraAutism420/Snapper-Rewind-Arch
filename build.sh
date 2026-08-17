@@ -493,6 +493,64 @@ editor no
 console-mode max
 EOF
 
+# 17. reset-default-to-at
+cat > "$BUILD_DIR/reset-default-to-at" <<'EOF'
+#!/bin/bash
+# reset-default-to-at - Reset default Btrfs subvolume to ID 256 after kernel updates
+
+CURRENT_DEFAULT=$(btrfs subvolume get-default / | awk '{print $2}')
+
+if [ "$CURRENT_DEFAULT" -eq 256 ]; then
+    echo "✅ Default already set to 256 — no action needed"
+    exit 0
+fi
+
+echo "⚠️  Default subvolume is $CURRENT_DEFAULT — resetting to 256"
+
+# Reset the default subvolume
+btrfs subvolume set-default 256 /
+
+# Interactive reboot prompt (only if running in a terminal)
+if [ -t 0 ] && [ -t 1 ]; then
+    echo "Do you want to reboot now to apply the change? (y/N): "
+    read -t 30 USER_INPUT
+
+    if [ -z "$USER_INPUT" ]; then
+        echo "⏳ No input received within 30 seconds — skipping reboot."
+        echo "The default subvolume has been reset. Reboot when ready."
+    elif [[ "$USER_INPUT" =~ ^[Yy]$ ]]; then
+        echo "🔄 Rebooting in 2 seconds..."
+        sleep 2
+        systemctl reboot
+    else
+        echo "❌ Skipping reboot. Default reset will apply on next reboot."
+    fi
+else
+    echo "⏳ Running in non‑interactive mode — resetting default without reboot."
+    echo "Default will be applied on next manual reboot."
+fi
+EOF
+
+# 18. zzzz-default-reset.hook
+cat > "$BUILD_DIR/zzzz-default-reset.hook" <<EOF
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Package
+Target = linux
+Target = linux-zen
+Target = linux-lts
+
+[Action]
+Description = Resetting default subvolume to @ (ID 256) after kernel update...
+When = PostTransaction
+Exec = /usr/local/bin/reset-default-to-at
+Depends = btrfs-progs
+EOF
+
+# Make reset-default-to-at executable
+chmod +x "$BUILD_DIR/reset-default-to-at"
+
 # === Summary ===
 section "Build complete"
 info "Package built in: $BUILD_DIR"
@@ -583,6 +641,11 @@ if [[ "$DEPLOY" == "true" ]]; then
     else
         echo "loader.conf already exists – please merge manually if needed."
     fi
+
+    # --- Reset default to @ hook ---
+    cp -v reset-default-to-at /usr/local/bin/
+    chmod +x /usr/local/bin/reset-default-to-at
+    cp -v zzzz-default-reset.hook /etc/pacman.d/hooks/
 
     # --- Reload and enable timers ---
     systemctl daemon-reload
