@@ -61,7 +61,7 @@ A portable, self‑healing Arch Linux recovery system using:
 
 The deploy script will install:
 ```bash
-snapper btrfs-progs sbctl snap-pac ukify
+snapper btrfs-progs sbctl snap-pac ukify rsync
 
 If you're not using Secure Boot, you can skip sbctl – comment it out in deploy.sh.
 
